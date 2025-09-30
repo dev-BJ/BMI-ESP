@@ -96,11 +96,6 @@ void initSDCard() {
   }
 }
 
-// uint64_t sdcardSize(){
-//   uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
-//   return cardSize;
-// }
-
 // Initialize Wi-Fi and web server
 void initWiFiAndServer() {
   WiFi.softAP(ssid, password);
@@ -189,7 +184,7 @@ bool saveImage(String timestamp) {
 }
 
 // Send JSON response over Serial
-void sendSerialJson(const char* cmd, const char* msg) {
+void sendSerialJson(const char* cmd, const char* msg, String host = "") {
   jsonDoc.clear();
   jsonDoc["cmd"] = cmd;
   if (msg) jsonDoc["msg"] = msg;
@@ -237,7 +232,7 @@ void handleRoot() {
     <table id="dataTable" border="1">
       <tr>
         <th>ID</th>
-        <th>Height (cm)</th>
+        <th>Height (m)</th>
         <th>Weight (kg)</th>
         <th>BMI</th>
         <th>Age</th>
@@ -279,9 +274,11 @@ void handleRoot() {
       updateTable(currentData);
     }
     function applyFilter() {
+      console.log(e)
       updateTable(currentData);
     }
     function resetFilter() {
+      console.log("reset")
       updateTable(currentData);
     }
     function fetchData() {
@@ -298,12 +295,15 @@ void handleRoot() {
 
     const age_filter = document.querySelector("#ageFilter")
     age_filter.onkeyup = function(e){
+      console.log(e.currentTarget.value)
       let filtered_data = currentData.filter(data => data.age == e.currentTarget.value || data)
       updateTable(filtered_data)
     }
 
     const date_filter = document.querySelector("#dateFilter")
     date_filter.onkeyup = function(e){
+      console.log(e.currentTarget.value)
+      if
       let filtered_data = currentData.filter(data => data.timestamp.indexOf(e.currentTarget.value) > 0 || data)
       updateTable(filtered_data)
     }
@@ -500,7 +500,6 @@ void serialTask(void* pvParameters) {
         sendSerialJson("ping", "pong");
       } else if (cmd == "host") {
         sendSerialJson("host", ipAddress);
-        vTaskDelay(200 / portTICK_PERIOD_MS);
       } else if (cmd == "bmi_data") {
         float height = jsonDoc["height"].as<float>() / 100;
         float weight = jsonDoc["weight"].as<float>();
@@ -515,15 +514,7 @@ void serialTask(void* pvParameters) {
         saveDataToCsv(height, weight, bmi, age, timestamp, imageName, batteryVoltage);  // Convert height to cm
         bool success = saveImage(timestamp);
         sendSerialJson("status", success ? "IMG_OK" : "IMG_ERR");
-        vTaskDelay(200 / portTICK_PERIOD_MS);
-      } else if (cmd == "size"){
-        char size_buf[30];
-        String(String((SD_MMC.usedBytes() / (1024 * 1024))) + " / " + String((SD_MMC.totalBytes() / (1024 * 1024))) + " MB").toCharArray(size_buf, sizeof(size_buf));
-        // vTaskDelay(100 / portTICK_PERIOD_MS);
-        // sdcard_size.toCharArray(size_buf, sizeof(size_buf));
-        sendSerialJson("size", size_buf);
-        vTaskDelay(200 / portTICK_PERIOD_MS);
-      }else {
+      } else {
         sendSerialJson("status", "INVALID_CMD");
       }
       jsonDoc.clear();
@@ -559,4 +550,3 @@ void loop() {
 }
 
 // {"cmd":"bmi_data","height":173.00,"weight":51.58,"bmi":17.24,"timestamp":"2025-09-29 19:33","battery": 3.10,"age":"89"}
-// {"cmd":"size"}

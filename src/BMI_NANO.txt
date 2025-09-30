@@ -1,0 +1,525 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <HX711.h>
+#include <RTClib.h>
+// #include <ArduinoJson.h>
+#include <SoftwareSerial.h>
+#include <Keypad.h>
+#include <avr/pgmspace.h>
+
+bool getJsonField(const char* json, const char* key, char* out, size_t outSize);
+bool buildBmiJson(char* buf, size_t size,
+                  float height, float weight, float bmi,
+                  const char* timestamp, float battery, String age);
+
+#define TRIG_PIN 5
+#define ECHO_PIN 4
+#define HX711_DT 3
+#define HX711_SCK 2
+#define READY_LED 10
+#define BUSY_LED 9
+#define SS_TX 8
+#define SS_RX 7
+#define SS_BAUD 38400
+#define VOLTAGE_SENSOR A6  // NOTE: A6 exists on some AVR boards (eg. Pro Mini), not UNO's headers
+#define CAPTURE_DELAY 3000UL
+#define INITIAL_HEIGHT 258     // in cm
+#define HEIGHT_THRESHOLD 50    // in cm (minimum detectable)
+#define WEIGHT_THRESHOLD 5.0f  // kg threshold
+
+// PROGMEM strings
+const char STR_BMI_SYSTEM[] PROGMEM = "BMI SYSTEM";
+const char STR_RTC_FAILED[] PROGMEM = "RTC Failed";
+const char STR_ESP_ERROR[] PROGMEM = "ESP Error";
+const char STR_INVALID_CMD[] PROGMEM = "Invalid CMD";
+const char STR_CAPTURED[] PROGMEM = "CAPTURED";
+const char STR_NOT_CAPTURED[] PROGMEM = "NOT CAPTURED";
+const char STR_JSON_ERROR[] PROGMEM = "JSON Error";
+const char STR_STEP_ON[] PROGMEM = "STEP ON SCALE";
+const char STR_STEP_DOWN[] PROGMEM = "STEP DOWN FROM";
+const char STR_SCALE_PLEASE[] PROGMEM = "SCALE PLEASE";
+const char STR_IMG_OK[] PROGMEM = "IMG_OK";
+const char STR_PONG[] PROGMEM = "pong";
+const char STR_OK_CANCEL[] PROGMEM = "* Ok, # Cancel";
+const char STR_CANCELED[] PROGMEM = "Canceled";
+const char STR_SENT_BMI[] PROGMEM = "Sent to BMI";
+const char STR_NO_AGE[] PROGMEM = "No age!?";
+const char STR_INPUT_AGE[] PROGMEM = "Input age?";
+const char NO_RTC[] PROGMEM = "NO RTC";
+
+bool esp_alive = false;
+char esp_address[20] = "\0";  // Reduced from 20
+unsigned long lastMillis = 0;
+unsigned long captureMillis = 0;
+uint8_t display = 0;
+const int16_t calibration_factor = -22550;
+bool measured = false;
+bool allow_keypad = false;
+char key = NO_KEY;
+char lastKey = '\0';
+const byte ROWS = 4;
+const byte COLS = 3;
+char timestamp_buf[20] = "";
+volatile uint8_t seconds = 0;
+String age = "";
+uint16_t captured_height = 0;
+float captured_weight = 0;
+bool startSecondsCount = false;
+bool timerReset = false;
+volatile float weight = 0;
+
+byte rowPins[ROWS] = { 15, 16, 17, 14 };
+byte colPins[COLS] = { 12, 6, 11 };
+char keys[ROWS][COLS] = {
+  { '1', '2', '3' },
+  { '4', '5', '6' },
+  { '7', '8', '9' },
+  { '*', '0', '#' }
+};
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+HX711 scale;
+RTC_DS3231 rtc;
+SoftwareSerial com(SS_RX, SS_TX);
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+// JSON doc
+// StaticJsonDocument<140> doc;  // slightly larger to avoid OOM when building BMI packet
+
+// void timer1_init() {
+//   // CTC mode: Clear Timer on Compare Match
+//   TCCR1B |= (1 << WGM12);
+//   // Set compare value for 1s
+//   OCR1A = 15624;
+//   // Enable CTC interrupt
+//   TIMSK1 |= (1 << OCIE1A);
+//   // Start timer with 1024 prescaler
+//   TCCR1B |= (1 << CS12) | (1 << CS10);
+// }
+
+void setup() {
+  Serial.begin(9600);  // optional debug serial
+  com.begin(SS_BAUD);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(HX711_SCK, OUTPUT);
+  pinMode(BUSY_LED, OUTPUT);
+  pinMode(READY_LED, OUTPUT);
+  pinMode(VOLTAGE_SENSOR, INPUT);
+
+  // timer1_init();
+  // sei();
+
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(3, 0);
+  char buf[20];
+  strcpy_P(buf, STR_BMI_SYSTEM);
+  lcd.print(buf);
+
+  if (!rtc.begin()) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    strcpy_P(buf, STR_RTC_FAILED);
+    lcd.print(buf);
+    unsigned long delayStart = millis();
+    while (millis() - delayStart < 2000) {
+      handleIncomingSerial();
+      key = keypad.getKey();
+      if (key != NO_KEY) break;
+    }
+  }
+
+  digitalWrite(BUSY_LED, HIGH);
+  digitalWrite(READY_LED, HIGH);
+
+  scale.begin(HX711_DT, HX711_SCK);
+  scale.set_scale(calibration_factor);
+  scale.tare();
+
+  digitalWrite(BUSY_LED, LOW);
+  digitalWrite(READY_LED, LOW);
+}
+
+uint16_t getHeight() {
+  // Ultrasonic: returns height in cm relative to INITIAL_HEIGHT (cm).
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);  // microseconds
+  if (duration <= 0) return 0;
+  float distance_cm = (duration * 0.034) / 2.0;  // cm
+  // Serial.print(F("Actual Height: "));
+  // Serial.print(distance_cm);
+  int32_t height = (int32_t)INITIAL_HEIGHT - (int32_t)(distance_cm + 0.5);
+  if (height < HEIGHT_THRESHOLD || height > INITIAL_HEIGHT) return 0;
+  return (uint16_t)height;
+}
+
+float getWeight() {
+  if (scale.is_ready()) {
+    return scale.get_units(5);
+  }
+  return 0.0f;
+}
+
+float calculateBMI(uint16_t height_cm, float weight_kg) {
+  if (height_cm <= 0 || weight_kg <= 0) return 0.0f;
+  float height_m = height_cm / 100.0f;
+  return weight_kg / (height_m * height_m);
+}
+
+void updateTimestamp() {
+  if (!rtc.lostPower()) {
+    DateTime now = rtc.now();
+    snprintf(timestamp_buf, sizeof(timestamp_buf), "%04d-%02d-%02d %02d:%02d",
+             now.year(), now.month(), now.day(), now.hour(), now.minute());
+    return;
+  }
+  strcpy_P(timestamp_buf, NO_RTC);
+}
+
+void handleIncomingSerial() {
+  if (com.available() > 0) {
+    // read until newline, but limit buffer size to avoid memory problems
+    String s = com.readStringUntil('\n');
+    s.trim();
+    if (s.length() == 0) return;
+    Serial.print(F("ESP data: "));
+    Serial.println(s);
+
+    char data[140];
+    s.toCharArray(data, sizeof(data));
+
+    char cmd_buf[10];
+    char msg_buf[20];
+    // DeserializationError error = deserializeJson(doc, s);
+
+    if (getJsonField(data, "cmd", cmd_buf, sizeof(cmd_buf)) && getJsonField(data, "msg", msg_buf, sizeof(msg_buf))) {
+      // String cmd = doc["cmd"].as<String>();
+      if (strcmp(cmd_buf, "host") == 0) {
+        strncpy(esp_address, msg_buf, sizeof(esp_address) - 1);
+        esp_address[sizeof(esp_address)] = '\0';
+      } else if (strcmp(cmd_buf, "ping") == 0) {
+        // String msg = doc["msg"].as<String>();
+        if (strcmp(msg_buf, "pong") != 0) {
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          char buf[20];
+          strcpy_P(buf, STR_ESP_ERROR);
+          lcd.print(buf);
+        } else {
+          esp_alive = true;
+        }
+      } else if (strcmp(cmd_buf, "status") == 0) {
+        // String msg = doc["msg"].as<String>();
+        lcd.clear();
+
+        char buf[20];
+        if (strcmp(msg_buf, "INVALID_CMD") == 0) {
+          lcd.setCursor(3, 0);
+          strcpy_P(buf, STR_INVALID_CMD);
+        } else if (strcmp(msg_buf, "IMG_OK") == 0) {
+          lcd.setCursor(4, 0);
+          strcpy_P(buf, STR_CAPTURED);
+        } else {
+          lcd.setCursor(1, 0);
+          strcpy_P(buf, STR_NOT_CAPTURED);
+        }
+        lcd.print(buf);
+        delay(1000);
+      }
+    } else {
+      lcd.clear();
+      lcd.setCursor(2, 0);
+      char buf[20];
+      strcpy_P(buf, STR_JSON_ERROR);
+      lcd.print(buf);
+    }
+    // safeClearDoc();
+  }
+}
+
+bool buildBmiJson(char* buf, size_t size,
+                  const char* height, const char* weight, const char* bmi,
+                  const char* timestamp, const char* battery, const char* age) {
+  // Serial.print(F(" | Height: "));
+  // Serial.print(height);
+  // Serial.print(F(" | Weight: "));
+  // Serial.print(weight);
+  // Serial.println();
+  int buf_len = snprintf(buf, size,
+                         "{\"cmd\":\"bmi_data\",\"height\":%s,\"weight\":%s,"
+                         "\"bmi\":%s,\"timestamp\":\"%s\",\"battery\":%s,\"age\":\"%s\"}",
+                         height, weight, bmi, timestamp, battery, age);
+  Serial.print(F("NANO data: "));
+  Serial.println(buf);
+  if (buf_len >= 0) return true;
+  return false;
+}
+
+bool buildCmdJson(char* buf, size_t size, const char* cmd) {
+  // snprintf(buf, size, "{\"cmd\":\"%s\",\"msg\":\"%s\"}", cmd, msg);
+  int buf_len = snprintf(buf, size, "{\"cmd\":\"%s\"}", cmd);
+  Serial.print(F("NANO data: "));
+  Serial.println(buf);
+  if (buf_len >= 0) return true;
+  return false;
+}
+
+bool getJsonField(const char* json, const char* key, char* out, size_t outSize) {
+  char pattern[32];
+  snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+  char* start = strstr(json, pattern);
+  if (!start) return false;
+  start += strlen(pattern);
+  char* end = strchr(start, '"');
+  if (!end) return false;
+  size_t len = end - start;
+  if (len >= outSize) len = outSize - 1;
+  strncpy(out, start, len);
+  out[len] = '\0';
+  return true;
+}
+
+void appendChar(char* str, char c) {
+  int len = strlen(str);
+  if (len < sizeof(str) - 1 && c != '\0') {  // Ensure space for null terminator
+    str[len] = c;
+    str[len + 1] = '\0';
+  }
+}
+
+void loop() {
+  uint16_t height = getHeight();  // cm
+  float weight = getWeight();     // kg
+  if (allow_keypad) {
+    key = keypad.getKey();
+    if (key != NO_KEY) lastKey = key;
+  }
+  updateTimestamp();
+  float battery_voltage = (analogRead(VOLTAGE_SENSOR) / 1023.0f) * 4.2f;
+  Serial.print(F(" | Height: "));
+  Serial.print(height);
+  Serial.print(F(" | Weight: "));
+  Serial.print(weight);
+  Serial.print(F(" | Key: "));
+  Serial.print(key);
+  Serial.print(F(" | Last Key: "));
+  Serial.print(lastKey);
+  // Serial.print(F("States"));
+  // Serial.print(F(" | measured: "));
+  // Serial.print(measured);
+  Serial.print(F(" | Allow Keypad: "));
+  Serial.print(allow_keypad);
+  Serial.print(F(" | Capture Millis: "));
+  Serial.print(captureMillis);
+  // Serial.print(F(" | Start Seconds Timer: "));
+  // Serial.print(startSecondsCount);
+  // Serial.print(F(" | Timer Reset: "));
+  // Serial.print(timerReset);
+  // Serial.print(F(" | Seconds Count: "));
+  // Serial.print(seconds);
+  Serial.println();
+
+  // if(weight < WEIGHT_THRESHOLD) height = 0; // control height because of false reading
+
+  // ping ESP if not alive
+  if (!esp_alive) {
+    char buf[20];
+    // char cmd[5] = "ping";
+    if (buildCmdJson(buf, sizeof(buf), "ping")) {
+      com.println(buf);
+    } else {
+      digitalWrite(BUSY_LED, HIGH);
+      digitalWrite(READY_LED, HIGH);
+    }
+    // safeClearDoc();
+  }
+
+  handleIncomingSerial();
+
+  if (millis() - lastMillis >= 5000UL) {
+    display = (display == 0) ? 1 : 0;
+    lastMillis = millis();
+  }
+
+  // START: user steps on scale -> start capture timer
+  if (weight > WEIGHT_THRESHOLD && height > HEIGHT_THRESHOLD && !measured && !allow_keypad) {
+    // if captureMillis not started, initialize it
+    if (captureMillis == 0) {
+      captureMillis = millis();
+    }
+
+    digitalWrite(BUSY_LED, HIGH);
+    digitalWrite(READY_LED, LOW);
+
+    // Show current H (m) and W (kg) and remaining hold time
+    char h_buf[8], w_buf[8];
+    dtostrf(height / 100.0f, 4, 2, h_buf);  // meters
+    dtostrf(weight, 5, 2, w_buf);
+
+    unsigned long elapsed = millis() - captureMillis;
+    unsigned long remain = (elapsed >= CAPTURE_DELAY) ? 0 : (CAPTURE_DELAY - elapsed) / 1000UL;
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("H:");
+    lcd.print(h_buf);
+    lcd.print("m W:");
+    lcd.print(w_buf);
+    lcd.setCursor(4, 1);
+    lcd.print("HOLD ON");
+    // lcd.print(remain);
+    // lcd.print("s");
+
+    // If held long enough, capture
+    // elapsed >= CAPTURE_DELAY
+    // seconds >= CAPTURE_DELAY && startSecondsCount
+    if (elapsed >= CAPTURE_DELAY) {
+      float bmi = calculateBMI(height, weight);
+      char bmi_buf[8];
+      dtostrf(bmi, 5, 2, bmi_buf);
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("H:");
+      lcd.print(h_buf);
+      lcd.print("m W:");
+      lcd.print(w_buf);
+      lcd.setCursor(0, 1);
+      lcd.print("BMI:");
+      lcd.print(bmi_buf);
+
+      captured_height = height;
+      captured_weight = weight;
+
+      measured = true;
+      allow_keypad = true;
+
+      // reset captureMillis for next use
+      captureMillis = 0;
+    }
+  }
+  // User still on scale after capture, prompt to step down
+  else if (weight > WEIGHT_THRESHOLD && height > HEIGHT_THRESHOLD && measured && allow_keypad) {
+    lcd.clear();
+    lcd.setCursor(1, 0);
+    char buf[20];
+    strcpy_P(buf, STR_STEP_DOWN);
+    lcd.print(buf);
+    lcd.setCursor(2, 1);
+    strcpy_P(buf, STR_SCALE_PLEASE);
+    lcd.print(buf);
+  }
+  // User stepped off and keypad is allowed -> handle confirm/send/cancel
+  else if (weight < WEIGHT_THRESHOLD && height < HEIGHT_THRESHOLD && allow_keypad && measured) {
+    digitalWrite(BUSY_LED, HIGH);
+    digitalWrite(READY_LED, LOW);
+    lcd.clear();
+    lcd.home();
+    char buf[20];
+    // char clear[1] = "";
+    strcpy_P(buf, STR_OK_CANCEL);
+    lcd.print(buf);
+    // lcd.setCursor(0, 1);
+    lcd.setCursor(0, 1);
+    strcpy_P(buf, STR_INPUT_AGE);
+    lcd.print(buf);
+    lcd.setCursor(strlen(buf) + 1, 1);
+    lcd.print(age);
+
+    if (lastKey == '#') {
+      lcd.clear();
+      lcd.setCursor(3, 0);
+      strcpy_P(buf, STR_CANCELED);
+      lcd.print(buf);
+      delay(500);
+      measured = false;
+      allow_keypad = false;
+      age = "";
+      lastKey = '\0';
+    } else if (lastKey == '*' && age.length() > 0) {
+      char buf[140];
+      char age_buf[4], h_buf[8], w_buf[8], bmi_buf[8], bat_buf[8];
+      age.toCharArray(age_buf, sizeof(age_buf));
+      dtostrf(captured_height, 5, 2, h_buf);
+      dtostrf(captured_weight, 5, 2, w_buf);
+      dtostrf(calculateBMI(captured_height, captured_weight), 5, 2, bmi_buf);
+      dtostrf(battery_voltage, 5, 2, bat_buf);
+      bool state = buildBmiJson(buf, sizeof(buf), h_buf, w_buf, bmi_buf, timestamp_buf, bat_buf, age_buf);
+      if (state) {
+        com.println(buf);
+      } else {
+        digitalWrite(BUSY_LED, HIGH);
+        digitalWrite(READY_LED, HIGH);
+      }
+
+      captured_height = 0;
+      captured_weight = 0;
+      age = "";
+      lastKey = '\0';
+
+      lcd.clear();
+      lcd.setCursor(2, 1);
+      strcpy_P(buf, STR_SENT_BMI);
+      lcd.print(buf);
+      measured = false;
+      allow_keypad = false;
+      lastKey = '\0';
+    } else if (lastKey == '*' && age.length() == 0) {
+      // doc["age"].as<String>().length() <= 0
+      lcd.clear();
+      lcd.setCursor(3, 0);
+      strcpy_P(buf, STR_NO_AGE);
+      lcd.print(buf);
+      delay(500);
+      lastKey = '\0';
+    } else if (lastKey >= '0' && lastKey <= '9') {
+      age = age + String(lastKey);
+      lastKey = '\0';
+    }
+    // lastKey = '\0';
+  }
+  // Idle state: show step-on prompt or battery/host info
+  else if (weight < WEIGHT_THRESHOLD && !allow_keypad && !measured && height < HEIGHT_THRESHOLD) {
+    digitalWrite(READY_LED, HIGH);
+    digitalWrite(BUSY_LED, LOW);
+    if (display == 0) {
+      lcd.clear();
+      lcd.setCursor(2, 0);
+      char buf[20];
+      strcpy_P(buf, STR_STEP_ON);
+      lcd.print(buf);
+      lcd.setCursor(0, 1);
+      lcd.print(timestamp_buf);
+    } else if (display == 1 && esp_address[0] != '\0') {
+      char v_buf[8];
+      dtostrf(battery_voltage, 5, 2, v_buf);
+      lcd.clear();
+      lcd.setCursor(4, 0);
+      lcd.print(v_buf);
+      lcd.print(" V");
+      lcd.setCursor(1, 1);
+      if (strlen(esp_address) != 14) strncat(esp_address, ":80\0", sizeof(esp_address) - 1);
+      lcd.print(esp_address);
+    } else {
+      // doc["cmd"] = "host";
+      // serializeJson(doc, com);
+      // safeClearDoc();
+      char buf[20];
+      if (buildCmdJson(buf, sizeof(buf), "host")) {
+        com.println(buf);
+      } else {
+        digitalWrite(BUSY_LED, HIGH);
+        digitalWrite(READY_LED, HIGH);
+      }
+      display = 0;
+    }
+
+    // reset capture timer if previously started and user stepped off
+    captureMillis = 0;
+  }
+
+  // delay(10);
+}
